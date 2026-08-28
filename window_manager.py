@@ -15,18 +15,21 @@ window_manager.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 import ctypes
+import logging
+import os
 import time
 
 import win32con
 import win32gui
 
+LOGGER = logging.getLogger("qq_farm_helper.window")
+
 
 DEFAULT_WINDOW_KEYWORDS = [
     "QQ经典农场",
-    "QQ农场",
-    "QQ空间",
     "MuMu",
     "雷电模拟器",
     "腾讯手游助手",
@@ -180,8 +183,10 @@ def enum_candidate_windows(
 
     win32gui.EnumWindows(callback, None)
 
-    # 优先面积大的、标题更匹配的窗口
-    results.sort(key=lambda w: w.client_rect.width * w.client_rect.height, reverse=True)
+    # 排序策略：
+    # 1. 标题短的优先（"QQ经典农场" 5字 优先于 "QQ农场辅助...浏览器" 长标题）
+    # 2. 标题相同/接近时，面积大的优先
+    results.sort(key=lambda w: (len(w.title), -w.client_rect.width * w.client_rect.height))
     return results
 
 
@@ -270,6 +275,64 @@ def print_candidate_windows(keywords: Optional[Iterable[str]] = None) -> None:
             f"client={w.client_rect.left},{w.client_rect.top},"
             f"{w.client_rect.width}x{w.client_rect.height}"
         )
+
+
+def close_game_window(hwnd: int) -> bool:
+    """
+    向窗口发送 WM_CLOSE，优雅关闭小程序窗口。
+    关闭后等待 0.8 秒让窗口真正消失。
+    """
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        time.sleep(0.8)
+        return True
+    except Exception:
+        return False
+
+
+def launch_from_shortcut(shortcut_path: str | Path) -> bool:
+    """
+    通过桌面快捷方式（.lnk）启动 QQ 经典农场小程序。
+    使用 os.startfile，Windows 原生支持。
+    """
+    try:
+        shortcut_path = str(shortcut_path)
+        if not os.path.exists(shortcut_path):
+            LOGGER.warning(f"快捷方式不存在: {shortcut_path}")
+            return False
+        os.startfile(shortcut_path)
+        return True
+    except Exception as e:
+        LOGGER.warning(f"启动快捷方式失败: {e}")
+        return False
+
+
+def restart_game_window(
+    hwnd: int,
+    shortcut_path: str | Path,
+    wait_timeout: float = 15.0,
+    keywords: Optional[Iterable[str]] = None,
+) -> Optional[GameWindow]:
+    """
+    一键重启：关闭旧窗口 → 从快捷方式启动 → 等待新窗口出现。
+    返回新的 GameWindow，超时返回 None。
+    """
+    # 1. 关闭旧窗口
+    if hwnd and win32gui.IsWindow(hwnd):
+        close_game_window(hwnd)
+
+    # 2. 启动新窗口
+    if not launch_from_shortcut(shortcut_path):
+        return None
+
+    # 3. 等待窗口出现（小程序启动需要几秒）
+    return wait_for_game_window(
+        keywords=keywords or DEFAULT_WINDOW_KEYWORDS,
+        timeout=wait_timeout,
+        interval=0.5,
+    )
 
 
 if __name__ == "__main__":

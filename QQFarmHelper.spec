@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+
+# 收集 customtkinter 的主题/字体等数据文件
+ctk_datas = collect_data_files('customtkinter')
 
 a = Analysis(
     ['main_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('templates', 'templates'), ('config_runtime.json', '.')],
-    hiddenimports=['cv2', 'numpy', 'pywintypes', 'win32api', 'win32con', 'win32gui'],
+    datas=[('templates', 'templates'), ('config_runtime.json', '.')] + ctk_datas,
+    hiddenimports=['cv2', 'numpy', 'pywintypes', 'win32api', 'win32con', 'win32gui', 'PIL._tkinter_finder'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

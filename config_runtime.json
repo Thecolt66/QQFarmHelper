@@ -29,5 +29,25 @@
     "save_unknown_screenshot": true,
     "save_error_screenshot": true,
     "debug_dir": "logs/runtime_debug"
+  },
+  "refresh": {
+    "enabled": true,
+    "interval_seconds": 180,
+    "shortcut_path": "C:\\Users\\mayumo\\Desktop\\QQ经典农场-QQ小程序.lnk",
+    "wait_timeout": 15,
+    "reset_visited_cache": true
+  },
+  "advanced_pick": {
+    "enabled": true,
+    "max_clicks_per_friend": 12,
+    "click_interval": 0.6,
+    "stabilize_delay": 1.0,
+    "use_mask_fallback": true,
+    "use_star_hint": true
+  },
+  "farm": {
+    "enabled": true,
+    "daily_limit": 35,
+    "stats_file": "logs/farm_stats.json"
   }
 }

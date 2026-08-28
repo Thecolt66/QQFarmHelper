@@ -20,9 +20,12 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import sys
 import time
+import logging
 
 import cv2
 import numpy as np
+
+LOGGER = logging.getLogger("qq_farm_helper.vision")
 
 
 RatioROI = Sequence[float]
@@ -39,12 +42,19 @@ class PageType:
 
 DEFAULT_THRESHOLDS: Dict[str, float] = {
     "friend_menu": 0.72,
-    "friend_tab": 0.78,
-    "visit_button": 0.80,
-    "home_button": 0.76,
-    "pick_button": 0.80,
-    "pick_hand": 0.76,
+    "friend_tab": 0.55,
+    "visit_button": 0.70,
+    "home_button": 0.70,
+    "pick_button": 0.50,
+    "pick_hand": 0.50,
     "farm_button": 0.72,
+    # 高级作物单独摘取："可摘"文字标签（方案A）
+    "crop_pick_label": 0.62,
+    # 成熟作物上方的黄色"可摘"星星标识（方案E）
+    "ready_star": 0.74,
+    # 装饰星星排除模板（白天/夜晚），匹配到的位置会被过滤，不点击
+    "deco_star_day": 0.70,
+    "deco_star_night": 0.70,
 }
 
 
@@ -87,6 +97,9 @@ DEFAULT_ROIS: Dict[str, RatioROI] = {
 
     # 兼容旧调用名
     "bottom_action": [0.22, 0.64, 0.75, 0.82],
+
+    # 4. 高级作物检测：农田区域，搜索"摘取"文字和"可摘"星星
+    "farm_plots": [0.03, 0.26, 0.97, 0.68],
 }
 
 
@@ -97,6 +110,10 @@ DEFAULT_CLICK_POINTS: Dict[str, Tuple[float, float]] = {
     "first_visit": (0.855, 0.342),
     "home": (0.910, 0.748),
     "action_center": (0.500, 0.745),
+    # 一键偷菜按钮兜底坐标（底部中间偏左，模板未命中时使用）
+    "steal_button": (0.460, 0.750),
+    # 一键务农按钮兜底坐标（底部中间偏右，模板未命中时使用）
+    "farm_action": (0.580, 0.750),
 }
 
 
@@ -528,6 +545,266 @@ class Vision:
 
         best = max([farm, pick, hand], key=lambda r: r.score)
         return "NO_PICK", best
+
+    def detect_action_buttons(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple["MatchResult", "MatchResult"]:
+        """
+        分别检测一键偷菜和一键务农按钮，返回 (steal_match, farm_match)。
+        各自独立，调用者可分别决定是否点击。
+        未检测到时返回 found=False 的 MatchResult。
+        """
+        roi = self.rois["friend_action_buttons"]
+        scales = self._get_adaptive_scales(frame_bgr.shape)
+
+        farm = self.match_template(
+            frame_bgr, "farm_button", roi=roi,
+            threshold=self.thresholds.get("farm_button", 0.72), scales=scales,
+        )
+
+        pick = self.match_template(
+            frame_bgr, "pick_button", roi=roi,
+            threshold=self.thresholds.get("pick_button", 0.80), scales=scales,
+        )
+        hand = self.match_template(
+            frame_bgr, "pick_hand", roi=roi,
+            threshold=self.thresholds.get("pick_hand", 0.76), scales=scales,
+        )
+
+        # 一键偷菜：取 pick_button 和 pick_hand 中匹配分更高的
+        pick_candidates = [r for r in (pick, hand) if r.found]
+        if pick_candidates:
+            steal_match = max(pick_candidates, key=lambda r: r.score)
+        else:
+            steal_match = MatchResult("pick_button", False, 0.0)
+
+        return steal_match, farm
+
+    # ---------- 高级作物单独摘取（A+B+E 三层兜底） ----------
+
+    @staticmethod
+    def _text_color_mask(image_bgr: np.ndarray) -> np.ndarray:
+        """
+        方案B：提取疑似"可摘"文字的颜色掩码。
+        "可摘"文字通常是白色/浅黄色 + 深色描边，在 HSV 空间表现为
+        低饱和度、中高亮度。背景（土地/植物/装扮）饱和度较高，
+        可以通过颜色范围过滤掉大部分背景。
+        返回单通道二值图（文字区域为255，其余为0）。
+        """
+        if image_bgr.size == 0:
+            return np.zeros((1, 1), dtype=np.uint8)
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        # 白色/浅黄色：色相 0~30（含黄），饱和度低，亮度高
+        lower = np.array([0, 0, 170])
+        upper = np.array([35, 90, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+        # 轻微膨胀，让文字笔画更连续
+        kernel = np.ones((2, 2), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        return mask
+
+    def find_all_pick_labels(
+        self,
+        frame_bgr: np.ndarray,
+        threshold: Optional[float] = None,
+        max_results: int = 24,
+    ) -> List[MatchResult]:
+        """
+        方案A（主力）：在农田区域直接模板匹配所有"可摘"文字标签。
+        使用多尺度 + 低阈值 + NMS 去重。
+        模板 crop_pick_label.png 应只包含"可摘"二字，尽量少带背景。
+        """
+        roi = self.rois.get("farm_plots")
+        scales = self._get_adaptive_scales(frame_bgr.shape)
+        return self.find_all_templates(
+            frame_bgr,
+            "crop_pick_label",
+            roi=roi,
+            threshold=threshold,
+            max_results=max_results,
+            nms_iou=0.30,
+            scales=scales,
+        )
+
+    def find_pick_labels_by_mask(
+        self,
+        frame_bgr: np.ndarray,
+        threshold: float = 0.55,
+        max_results: int = 24,
+    ) -> List[MatchResult]:
+        """
+        方案B（兜底）：先对截图和模板都做颜色掩码，消除背景干扰后再匹配。
+        当方案A因为装扮背景差异漏检时，这个方法更鲁棒。
+        注意：掩码匹配的分数通常低于直接匹配，阈值设得较低。
+        """
+        roi = self.rois.get("farm_plots")
+        roi_img, roi_box = crop_roi(frame_bgr, roi)
+        roi_x1, roi_y1, _, _ = roi_box
+
+        # 对截图做颜色掩码
+        frame_mask = self._text_color_mask(roi_img)
+
+        # 对模板做颜色掩码
+        template = self.store.get("crop_pick_label")
+        tpl_mask = self._text_color_mask(template)
+
+        th, tw = tpl_mask.shape[:2]
+        sh, sw = frame_mask.shape[:2]
+        if th > sh or tw > sw:
+            return []
+
+        result = cv2.matchTemplate(frame_mask, tpl_mask, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(result >= threshold)
+
+        candidates: List[MatchResult] = []
+        for x, y in zip(xs, ys):
+            score = float(result[y, x])
+            abs_x1 = roi_x1 + int(x)
+            abs_y1 = roi_y1 + int(y)
+            abs_x2 = abs_x1 + int(tw)
+            abs_y2 = abs_y1 + int(th)
+            candidates.append(MatchResult(
+                template_name="crop_pick_label_mask",
+                found=True,
+                score=score,
+                box=(abs_x1, abs_y1, abs_x2, abs_y2),
+                center=((abs_x1 + abs_x2) // 2, (abs_y1 + abs_y2) // 2),
+                roi=roi_box,
+            ))
+
+        candidates.sort(key=lambda m: m.score, reverse=True)
+        return non_max_suppression(candidates, iou_threshold=0.30)[:max_results]
+
+    def find_all_ready_stars(
+        self,
+        frame_bgr: np.ndarray,
+        threshold: Optional[float] = None,
+        max_results: int = 24,
+    ) -> List[MatchResult]:
+        """
+        方案E（辅助验证）：检测成熟作物上方的黄色"可摘"星星标识。
+        这个图标是游戏UI元素，浮在最上层，完全不受玩家装扮影响，
+        匹配非常稳定。用于辅助定位需要单独摘取的作物。
+        """
+        roi = self.rois.get("farm_plots")
+        scales = self._get_adaptive_scales(frame_bgr.shape)
+        return self.find_all_templates(
+            frame_bgr,
+            "ready_star",
+            roi=roi,
+            threshold=threshold,
+            max_results=max_results,
+            nms_iou=0.30,
+            scales=scales,
+        )
+
+    def find_decoration_stars(
+        self,
+        frame_bgr: np.ndarray,
+        max_results: int = 20,
+    ) -> List["MatchResult"]:
+        """
+        检测画面中的装饰星星图案（白天/夜晚两种），返回所有位置。
+        这些位置会被排除，不会被当作"可摘"作物点击。
+        """
+        all_decos: List[MatchResult] = []
+        roi = self.rois.get("farm_plots")
+        scales = self._get_adaptive_scales(frame_bgr.shape)
+
+        for tpl_name in ("deco_star_day", "deco_star_night"):
+            try:
+                decos = self.find_all_templates(
+                    frame_bgr, tpl_name, roi=roi,
+                    threshold=self.thresholds.get(tpl_name, 0.70),
+                    max_results=max_results, nms_iou=0.30, scales=scales,
+                )
+                all_decos.extend(decos)
+            except FileNotFoundError:
+                pass
+
+        # 跨模板去重
+        return non_max_suppression(all_decos, iou_threshold=0.30)[:max_results]
+
+    @staticmethod
+    def _overlaps_any(
+        target: "MatchResult",
+        deco_list: List["MatchResult"],
+        max_distance_ratio: float = 1.2,
+    ) -> bool:
+        """
+        判断目标是否与任意装饰星星位置重叠。
+        使用中心距离判断：如果目标中心与装饰星星中心的距离
+        小于装饰星星宽度的 max_distance_ratio 倍，就认为重叠。
+        """
+        if not target.center or not deco_list:
+            return False
+        tx, ty = target.center
+        for deco in deco_list:
+            if not deco.center or not deco.box:
+                continue
+            dx, dy = deco.center
+            deco_w = deco.box[2] - deco.box[0]
+            distance = ((tx - dx) ** 2 + (ty - dy) ** 2) ** 0.5
+            if distance < deco_w * max_distance_ratio:
+                return True
+        return False
+
+    def detect_pick_targets(
+        self,
+        frame_bgr: np.ndarray,
+
+        use_mask_fallback: bool = True,
+        use_star_hint: bool = True,
+    ) -> Tuple[List[MatchResult], str]:
+        """
+        三层兜底综合检测：返回所有需要点击的"可摘"位置。
+        结果会自动过滤掉装饰星星图案的位置。
+
+        执行顺序：
+            1. 方案A：直接模板匹配"可摘"文字（主力）
+            2. 方案B：如果A没找到，用颜色掩码匹配兜底
+            3. 方案E：如果A+B都没找到，但检测到"可摘"星星，
+                       返回星星下方的点击位置（点击作物本身触发摘取）
+
+        返回：(匹配结果列表, 使用的方案名)
+        """
+        # 先检测所有装饰星星，用于后续过滤
+        decos = self.find_decoration_stars(frame_bgr)
+        if decos:
+            LOGGER.info(f"检测到 {len(decos)} 个装饰星星，将排除这些位置")
+
+        # 第一层：方案A 直接匹配（模板缺失时静默跳过）
+        try:
+            labels = self.find_all_pick_labels(frame_bgr)
+            if labels:
+                labels = [t for t in labels if not self._overlaps_any(t, decos)]
+            if labels:
+                return labels, "A_direct"
+        except FileNotFoundError:
+            pass
+
+        # 第二层：方案B 颜色掩码兜底（依赖 crop_pick_label 模板，缺失时跳过）
+        if use_mask_fallback:
+            try:
+                labels_mask = self.find_pick_labels_by_mask(frame_bgr)
+                if labels_mask:
+                    labels_mask = [t for t in labels_mask if not self._overlaps_any(t, decos)]
+                if labels_mask:
+                    return labels_mask, "B_color_mask"
+            except FileNotFoundError:
+                pass
+
+        # 第三层：方案E 可摘星星辅助（模板缺失时跳过）
+        if use_star_hint:
+            try:
+                stars = self.find_all_ready_stars(frame_bgr)
+            except FileNotFoundError:
+                stars = []
+            if stars:
+                # 直接点击"可摘"星星标识本身即可触发收取
+                return stars, "E_star_hint"
+
+        return [], "none"
 
     # ---------- 多帧确认 ----------
 

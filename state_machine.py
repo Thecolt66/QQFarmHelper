@@ -29,13 +29,14 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Any, List
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from window_manager import GameWindow, find_game_window, bring_to_front, DEFAULT_WINDOW_KEYWORDS
+from window_manager import GameWindow, find_game_window, bring_to_front, DEFAULT_WINDOW_KEYWORDS, restart_game_window
 from screen_capture import ScreenCapture
 from vision import Vision, PageType, DEFAULT_ROIS, DEFAULT_THRESHOLDS, DEFAULT_CLICK_POINTS, resource_path
 from clicker import Clicker
@@ -83,6 +84,29 @@ DEFAULT_RUNTIME_CONFIG: Dict[str, Any] = {
         "save_unknown_screenshot": True,
         "save_error_screenshot": True,
         "debug_dir": "logs/runtime_debug"
+    },
+
+    "refresh": {
+        "enabled": True,
+        "interval_seconds": 180,
+        "shortcut_path": "C:\\Users\\mayumo\\Desktop\\QQ经典农场-QQ小程序.lnk",
+        "wait_timeout": 15,
+        "reset_visited_cache": True
+    },
+
+    "advanced_pick": {
+        "enabled": True,
+        "max_clicks_per_friend": 12,
+        "click_interval": 0.6,
+        "stabilize_delay": 1.0,
+        "use_mask_fallback": True,
+        "use_star_hint": True
+    },
+
+    "farm": {
+        "enabled": True,
+        "daily_limit": 35,
+        "stats_file": "logs/farm_stats.json"
     }
 }
 
@@ -167,10 +191,17 @@ class FarmStateMachine:
         self.window: Optional[GameWindow] = None
         self.stats = BotStats()
         self.visited_rows: Dict[int, FriendVisitRecord] = {}
+        self.last_refresh_time: float = time.time()
+
+        # 一键务农每日计数（跨天重置，持久化到文件）
+        farm_cfg = self.config.get("farm", {})
+        self.farm_stats_path = Path(farm_cfg.get("stats_file", "logs/farm_stats.json"))
+        self.farm_count_date, self.farm_count_today = self._load_farm_count()
 
         debug_dir = Path(self.config["debug"].get("debug_dir", "logs/runtime_debug"))
         debug_dir.mkdir(parents=True, exist_ok=True)
         self.debug_dir = debug_dir
+        self._cleanup_old_debug_screenshots()
 
     # ---------- 基础工具 ----------
 
@@ -207,7 +238,25 @@ class FarmStateMachine:
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = self.debug_dir / f"{prefix}_{ts}.png"
         cv2.imwrite(str(path), frame)
+        # 每次保存后清理超过3天的旧截图
+        self._cleanup_old_debug_screenshots()
         return path
+
+    def _cleanup_old_debug_screenshots(self) -> None:
+        """清理超过3天的未知页面截图。"""
+        try:
+            cutoff = time.time() - 3 * 86400
+            for png_file in self.debug_dir.glob("*.png"):
+                m = re.search(r"(\d{8})_\d{6}", png_file.name)
+                if m:
+                    try:
+                        file_time = time.mktime(time.strptime(m.group(1), "%Y%m%d"))
+                        if file_time < cutoff:
+                            png_file.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def sleep(self, key: str) -> None:
         seconds = float(self.config.get("timing", {}).get(key, 0.5))
@@ -324,6 +373,11 @@ class FarmStateMachine:
         执行一次状态机步骤。
         main.py 会循环调用它。
         """
+        # 定时刷新检查：到点就重启小程序，避免好友状态缓存不更新
+        if self._should_refresh():
+            self._do_refresh()
+            return
+
         frame = self.grab()
         if frame is None:
             time.sleep(1.0)
@@ -398,33 +452,87 @@ class FarmStateMachine:
     def handle_friend_home(self, frame: np.ndarray) -> None:
         """
         好友家主页：
-            1. 检测一键务农/一键摘取。
-            2. 有摘取才点。
-            3. 识别到务农就跳过。
-            4. 最后回家。
+            1. 分别检测一键偷菜和一键务农。
+            2. 一键偷菜：始终点击（模板或兜底）。
+            3. 一键务农：每天限次（默认50次），未超限才点击。
+            4. 点完一键偷菜后，检测高级作物的单独"可摘"标签，逐个点击。
+            5. 最后回家。
         """
         if self.window is None:
             return
 
-        state, action = self.vision.detect_pick_or_farm(frame)
+        steal_match, farm_match = self.vision.detect_action_buttons(frame)
         LOGGER.info(
-            "action_state=%s best=%s score=%.3f center=%s",
-            state, action.template_name, action.score, action.center
+            "偷菜 found=%s score=%.3f | 务农 found=%s score=%.3f",
+            steal_match.found, steal_match.score,
+            farm_match.found, farm_match.score,
         )
 
-        if state == "PICK":
-            result = self.clicker.click_match(self.window, action)
-            LOGGER.info("点击摘取：%s", result)
+        allow_fallback = self.config.get("behavior", {}).get("allow_fallback_click", True)
+        steal_clicked = False
+
+        # ---- 1. 一键偷菜 ----
+        # 逻辑：
+        #   - 模板匹配到就点
+        #   - 没匹配到但务农按钮命中：根据务农按钮的 x 位置判断单/双按钮
+        #       * 务农在右侧(相对x>0.55) → 双按钮并排，偷菜在左侧，用兜底坐标点偷菜
+        #       * 务农在中间(相对x<=0.55) → 单按钮模式，本页没有偷菜，跳过
+        #   - 都没匹配到才用兜底坐标尝试
+        if steal_match.found:
+            result = self.clicker.click_match(self.window, steal_match)
+            LOGGER.info("点击一键偷菜（模板匹配）：%s", result)
             self.stats.picks += 1
+            steal_clicked = True
             self.sleep("after_pick_click")
-
-        elif state == "SKIP":
-            LOGGER.info("识别到一键务农，跳过，不点击")
-            self.stats.skips_farm += 1
-
+        elif farm_match.found and farm_match.center:
+            # 根据务农按钮 x 位置判断单/双按钮
+            farm_rel_x = farm_match.center[0] / max(1, self.window.client_rect.width)
+            if farm_rel_x > 0.55:
+                # 双按钮模式：务农在右侧，偷菜在左侧，用兜底坐标点偷菜
+                LOGGER.info(f"双按钮模式（务农相对x={farm_rel_x:.3f}），用兜底坐标点一键偷菜")
+                rx, ry = self.config["click_points"]["steal_button"]
+                result = self.clicker.click_relative(self.window, rx, ry)
+                LOGGER.info("点击一键偷菜（兜底坐标）：%s", result)
+                self.stats.picks += 1
+                steal_clicked = True
+                self.sleep("after_pick_click")
+            else:
+                # 单按钮模式：务农在中间，本页没有偷菜
+                LOGGER.info(f"单按钮模式（务农相对x={farm_rel_x:.3f}），本页无一键偷菜，跳过")
+        elif allow_fallback:
+            rx, ry = self.config["click_points"]["steal_button"]
+            result = self.clicker.click_relative(self.window, rx, ry)
+            LOGGER.warning("一键偷菜模板未命中且无务农按钮，使用兜底坐标点击：%s", result)
+            self.stats.picks += 1
+            steal_clicked = True
+            self.sleep("after_pick_click")
         else:
-            LOGGER.info("没有识别到可摘取按钮")
+            LOGGER.info("一键偷菜未识别且禁用兜底，跳过")
             self.stats.no_pick += 1
+
+        # ---- 2. 一键务农（每日限次） ----
+        farm_cfg = self.config.get("farm", {})
+        farm_enabled = bool(farm_cfg.get("enabled", True))
+        farm_limit = int(farm_cfg.get("daily_limit", 50))
+
+        if farm_enabled and farm_match.found and self._can_farm_today(farm_limit):
+            result = self.clicker.click_match(self.window, farm_match)
+            self._inc_farm_count()
+            LOGGER.info(
+                "点击一键务农：%s（今日 %d/%d）",
+                result, self.farm_count_today, farm_limit,
+            )
+            self.stats.skips_farm += 1  # 复用统计字段表示务农次数
+            self.sleep("after_pick_click")
+        elif farm_enabled and farm_match.found:
+            LOGGER.info("今日一键务农已达上限 %d 次，跳过", farm_limit)
+        elif farm_match.found and not farm_enabled:
+            LOGGER.info("一键务农功能已禁用，跳过")
+
+        # ---- 3. 高级作物单独摘取 ----
+        advanced_clicks = self._click_advanced_pick_labels() if steal_clicked else 0
+        if advanced_clicks > 0:
+            LOGGER.info("高级作物单独摘取完成，共点击 %d 次", advanced_clicks)
 
         # 重新截图后再找回家，避免摘取后画面变化
         frame2 = self.grab()
@@ -447,6 +555,138 @@ class FarmStateMachine:
 
         self.stats.cycles += 1
         self.sleep("after_home_click")
+
+    def _load_farm_count(self) -> tuple:
+        """从文件加载今日务农次数，跨天自动重置为0。"""
+        today = time.strftime("%Y-%m-%d")
+        try:
+            if self.farm_stats_path.exists():
+                with open(self.farm_stats_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("date") == today:
+                    return today, int(data.get("count", 0))
+        except Exception:
+            pass
+        return today, 0
+
+    def _save_farm_count(self) -> None:
+        """持久化今日务农次数到文件。"""
+        try:
+            self.farm_stats_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.farm_stats_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"date": self.farm_count_date, "count": self.farm_count_today},
+                    f, ensure_ascii=False,
+                )
+        except Exception:
+            pass
+
+    def _can_farm_today(self, daily_limit: int = 50) -> bool:
+        """检查今天是否还能点击一键务农（跨天自动重置）。"""
+        today = time.strftime("%Y-%m-%d")
+        if today != self.farm_count_date:
+            self.farm_count_date = today
+            self.farm_count_today = 0
+            self._save_farm_count()
+        return self.farm_count_today < daily_limit
+
+    def _inc_farm_count(self) -> None:
+        """务农次数+1并保存。"""
+        self.farm_count_today += 1
+        self._save_farm_count()
+
+    def _click_advanced_pick_labels(self) -> int:
+        """
+        高级作物单独摘取：循环检测并点击"可摘"标签，直到没有为止。
+        使用 A+B+E 三层兜底检测。返回实际点击次数。
+        """
+        cfg = self.config.get("advanced_pick", {})
+        if not cfg.get("enabled", True):
+            return 0
+        if self.window is None:
+            return 0
+
+        max_clicks = int(cfg.get("max_clicks_per_friend", 12))
+        click_interval = float(cfg.get("click_interval", 0.6))
+        stabilize_delay = float(cfg.get("stabilize_delay", 1.0))
+        use_mask = bool(cfg.get("use_mask_fallback", True))
+        use_star = bool(cfg.get("use_star_hint", True))
+
+        # 先等一键摘取的动画稳定
+        time.sleep(stabilize_delay)
+
+        clicks = 0
+        consecutive_empty = 0
+
+        while clicks < max_clicks and consecutive_empty < 2:
+            frame = self.grab()
+            if frame is None:
+                break
+
+            targets, method = self.vision.detect_pick_targets(
+                frame, use_mask_fallback=use_mask, use_star_hint=use_star
+            )
+
+            if not targets:
+                consecutive_empty += 1
+                LOGGER.debug("高级摘取：未检测到目标 (empty=%d/2)", consecutive_empty)
+                time.sleep(0.4)
+                continue
+
+            consecutive_empty = 0
+            target = targets[0]  # 每次只点第一个，点完重新检测
+            result = self.clicker.click_match(self.window, target)
+            clicks += 1
+            LOGGER.info(
+                "高级摘取 [%s] 点击 #%d: score=%.3f center=%s result=%s",
+                method, clicks, target.score, target.center, result
+            )
+            time.sleep(click_interval)
+
+        return clicks
+
+    def _should_refresh(self) -> bool:
+        """检查是否到了定时刷新时间。"""
+        cfg = self.config.get("refresh", {})
+        if not cfg.get("enabled", True):
+            return False
+        interval = float(cfg.get("interval_seconds", 300))
+        return (time.time() - self.last_refresh_time) >= interval
+
+    def _do_refresh(self) -> None:
+        """执行小程序重启刷新：关闭旧窗口 → 从桌面快捷方式启动 → 等待就绪。"""
+        cfg = self.config.get("refresh", {})
+        shortcut = cfg.get("shortcut_path", "")
+        wait_timeout = float(cfg.get("wait_timeout", 15))
+
+        LOGGER.info("定时刷新触发：重启小程序窗口")
+
+        old_hwnd = self.window.hwnd if self.window else None
+        keywords = self.config.get("window_keywords", DEFAULT_WINDOW_KEYWORDS)
+
+        new_win = restart_game_window(
+            hwnd=old_hwnd or 0,
+            shortcut_path=shortcut,
+            wait_timeout=wait_timeout,
+            keywords=keywords,
+        )
+
+        if new_win is None:
+            LOGGER.error("刷新失败：重启后未找到游戏窗口，保留原窗口引用")
+            self.last_refresh_time = time.time()
+            return
+
+        self.window = new_win
+        self.last_refresh_time = time.time()
+        LOGGER.info("刷新成功：新窗口 hwnd=%s title=%s", new_win.hwnd, new_win.title)
+
+        # 重置好友访问缓存，刷新后重新遍历
+        if cfg.get("reset_visited_cache", True):
+            self.visited_rows.clear()
+            LOGGER.info("已重置好友访问缓存")
+
+        # 等页面加载稳定
+        time.sleep(2.0)
 
     def handle_unknown(self, frame: np.ndarray, detection) -> None:
         self.stats.unknown_pages += 1
